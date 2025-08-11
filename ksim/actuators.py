@@ -146,7 +146,7 @@ class PositionActuators(Actuators):
 
     def get_actuator_name(self, joint_name: str) -> str:
         # This can be overridden if necessary.
-        return f"{joint_name}_ctrl"
+        return f"{joint_name}"
 
     def get_ctrl(self, action: Array, physics_data: PhysicsData, rng: PRNGKeyArray) -> Array:
         """Get the control signal from the (position) action vector."""

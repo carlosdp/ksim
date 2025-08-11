@@ -280,11 +280,11 @@ def log_joint_config_table(
     joint_data = []
     for joint_idx, joint_name in enumerate(joint_names):
         # Skip floating base and/or root joint as they are not actuated.
-        if joint_name in {"floating_base", "root"}:
+        if any(sub in joint_name for sub in {"floating_base", "root"}):
             continue
 
         dof_id = model.jnt_dofadr[joint_idx]
-        actuator_name = f"{joint_name}_ctrl"
+        actuator_name = f"{joint_name}"
 
         # Checks for errors in the joint configuration setup
         if actuator_name not in actuator_name_to_nn_id:
