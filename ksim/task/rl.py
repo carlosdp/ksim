@@ -44,7 +44,7 @@ from jax.core import get_aval
 from jax.typing import ArrayLike
 from jaxtyping import Array, PRNGKeyArray, PyTree
 from kmv.app.viewer import DefaultMujocoViewer, QtViewer
-from kmv.core.types import RenderMode
+from kmv.core.types import RenderMode, Marker, GeomType
 from mujoco import mjx
 from omegaconf import MISSING
 from PIL import Image, ImageDraw
@@ -1916,6 +1916,18 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
 
             transitions = []
 
+            if self.config.render_markers:
+                for i, marker in enumerate(markers):
+                    viewer.add_marker(
+                        Marker(
+                            id=f"marker_{i}",
+                            pos=marker.pos,
+                            size=marker.scale,
+                            geom_type=GeomType.SPHERE,
+                            rgba=marker.rgba,
+                        )
+                    )
+
             try:
                 for _ in iterator:
                     # Get commands
@@ -1954,6 +1966,11 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
                         clip_max=self.config.reward_clip_max,
                     )
                     env_states = replace(env_states, reward_carry=reward_state.carry)
+
+                    if self.config.render_markers:
+                        for i, marker in enumerate(markers):
+                            marker.update(traj_small)
+                            viewer.update_marker(f"marker_{i}", pos=marker.pos, size=marker.scale, rgba=marker.rgba)
 
                     # Send viewer the physics state
                     sim_time = float(env_states.physics_state.data.time)
@@ -1999,17 +2016,6 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
                     xfrc = viewer.drain_control_pipe()
                     if xfrc is not None:
                         env_states.physics_state.data.xfrc_applied[:] = xfrc
-
-                    # TODO: Support markers in kmv
-                    def render_callback(
-                        model: mujoco.MjModel,  # pyright: ignore[reportAttributeAccessIssue]
-                        data: mujoco.MjData,  # pyright: ignore[reportAttributeAccessIssue]
-                        scene: mujoco.MjvScene,  # pyright: ignore[reportAttributeAccessIssue]
-                        traj: Trajectory = transition,
-                    ) -> None:
-                        if self.config.render_markers:
-                            for marker in markers:
-                                marker(model, data, scene, traj)
 
                     if not viewer.is_open:
                         logger.info("Viewer closed, exiting environment loop")
