@@ -51,13 +51,14 @@ class PhysicsState:
 class Trajectory:
     """Stackable structure of transitions.
 
-    Note that `qpos`, `qvel`, `xpos`, `xquat`, `timestep`, `done` and `success`
+    Note that `qpos`, `qvel`, `cvel`, `xpos`, `xquat`, `timestep`, `done` and `success`
     are the values from *after* the action has been taken, while `obs` and
     `command` are the values from *before* the action has been taken.
     """
 
     qpos: Array
     qvel: Array
+    cvel: Array
     xpos: Array
     xquat: Array
     ctrl: Array
@@ -215,12 +216,12 @@ class ActuatorMetadata:
     @classmethod
     def from_model(cls, model: PhysicsModel) -> dict[str, "ActuatorMetadata"]:
         actuator_metadata = {}
-        
+
         for i in range(model.nu):  # nu is the number of actuators
             # Extract actuator name
             name_start = model.name_actuatoradr[i]
             name = model.names[name_start:].decode("utf-8").split("\x00", 1)[0]
-            
+
             # Determine actuator type based on dyntype
             # dyntype: 0=none, 1=integrator, 2=filter, 3=muscle
             dyntype = model.actuator_dyntype[i]
@@ -234,21 +235,21 @@ class ActuatorMetadata:
                 actuator_type = "muscle"
             else:
                 actuator_type = "unknown"
-            
+
             # Extract control and force ranges
             ctrl_range = model.actuator_ctrlrange[i]
             force_range = model.actuator_forcerange[i]
-            
+
             # Extract dynamics parameters (for filter dynamics: [armature, damping, frictionloss])
             # For other dynamics types, these parameters may have different meanings
             dynprm = model.actuator_dynprm[i]
             armature = float(dynprm[0]) if dyntype == 2 else None
             damping = float(dynprm[1]) if dyntype == 2 else None
             frictionloss = float(dynprm[2]) if dyntype == 2 else None
-            
+
             # Extract gain parameters
             gainprm = model.actuator_gainprm[i]
-            
+
             # Create metadata object
             actuator_metadata[name] = cls(
                 actuator_type=actuator_type,
@@ -258,7 +259,7 @@ class ActuatorMetadata:
                 max_torque=float(force_range[1]) if force_range[1] != 0 else None,
                 # Additional fields can be populated based on gainprm and other model properties
             )
-        
+
         return actuator_metadata
 
 

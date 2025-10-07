@@ -44,7 +44,7 @@ from jax.core import get_aval
 from jax.typing import ArrayLike
 from jaxtyping import Array, PRNGKeyArray, PyTree
 from kmv.app.viewer import DefaultMujocoViewer, QtViewer
-from kmv.core.types import RenderMode, Marker, GeomType
+from kmv.core.types import RenderMode, Marker as KMVMarker, GeomType
 from mujoco import mjx
 from omegaconf import MISSING
 from PIL import Image, ImageDraw
@@ -1060,6 +1060,7 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
         transition = Trajectory(
             qpos=jnp.array(next_physics_state.data.qpos),
             qvel=jnp.array(next_physics_state.data.qvel),
+            cvel=jnp.array(next_physics_state.data.cvel),
             xpos=jnp.array(next_physics_state.data.xpos),
             xquat=jnp.array(next_physics_state.data.xquat),
             ctrl=jnp.array(next_physics_state.data.ctrl),
@@ -1919,7 +1920,7 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
             if self.config.render_markers:
                 for i, marker in enumerate(markers):
                     viewer.add_marker(
-                        Marker(
+                        KMVMarker(
                             id=f"marker_{i}",
                             pos=marker.pos,
                             size=marker.scale,

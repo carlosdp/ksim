@@ -31,6 +31,7 @@ def create_test_trajectory(
 
     dummy_qpos = jnp.zeros((timesteps, 10))
     dummy_qvel = jnp.zeros((timesteps, 9))
+    dummy_cvel = jnp.zeros((timesteps, 9))
     dummy_xpos = jnp.zeros((timesteps, 5, 3))
     dummy_xquat = jnp.zeros((timesteps, 5, 4))
     dummy_ctrl = jnp.zeros((timesteps, action_dims))
@@ -41,6 +42,7 @@ def create_test_trajectory(
     return ksim.Trajectory(
         qpos=dummy_qpos,
         qvel=dummy_qvel,
+        cvel=dummy_cvel,
         xpos=dummy_xpos,
         xquat=dummy_xquat,
         ctrl=dummy_ctrl,
