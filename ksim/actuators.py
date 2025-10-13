@@ -76,7 +76,7 @@ class PositionActuators(Actuators):
         metadata: Metadata,
         action_noise: Noise | None = None,
         torque_noise: Noise | None = None,
-        action_scale: float = 1.0,
+        action_scale: float | Array = 1.0,
     ) -> None:
         """Creates easily vector multipliable kps and kds."""
         ctrl_name_to_idx = get_ctrl_data_idx_by_name(physics_model)
