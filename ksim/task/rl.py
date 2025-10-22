@@ -60,7 +60,7 @@ from ksim.observation import Observation, ObservationInput, StatefulObservation
 from ksim.randomization import PhysicsRandomizer
 from ksim.resets import Reset
 from ksim.rewards import Reward, StatefulReward
-from ksim.terminations import Termination
+from ksim.terminations import Termination, TerminationInput
 from ksim.types import (
     Action,
     Histogram,
@@ -274,13 +274,15 @@ def get_initial_reward_carry(
 
 def get_terminations(
     physics_state: PhysicsState,
+    commands: xax.FrozenDict[str, PyTree],
     terminations: xax.FrozenDict[str, Termination],
     curriculum_level: Array,
 ) -> xax.FrozenDict[str, Array]:
     """Get the terminations from the physics state."""
+    termination_input = TerminationInput(commands=commands, physics_state=physics_state)
     termination_dict = {}
     for name, termination in terminations.items():
-        termination_val = termination(physics_state.data, curriculum_level)
+        termination_val = termination(termination_input, curriculum_level)
         chex.assert_type(termination_val, int)
         termination_dict[name] = termination_val
     return xax.freeze_dict(termination_dict)
@@ -1047,6 +1049,7 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
         # Gets termination components and a single termination boolean.
         terminations = get_terminations(
             physics_state=next_physics_state,
+            commands=env_states.commands,
             terminations=constants.terminations,
             curriculum_level=env_states.curriculum_state.level,
         )

@@ -1,6 +1,7 @@
 """Defines the base termination class."""
 
 __all__ = [
+    "TerminationInput",
     "Termination",
     "NotUprightTermination",
     "MinimumHeightTermination",
@@ -14,15 +15,16 @@ __all__ = [
 import functools
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Collection, Literal, Self
 
 import attrs
 import jax
 import jax.numpy as jnp
 import xax
-from jaxtyping import Array
+from jaxtyping import Array, PyTree
 
-from ksim.types import PhysicsData, PhysicsModel
+from ksim.types import PhysicsModel, PhysicsState
 from ksim.utils.mujoco import get_geom_data_idx_by_name
 
 logger = logging.getLogger(__name__)
@@ -30,16 +32,23 @@ logger = logging.getLogger(__name__)
 SensorType = Literal["quaternion_orientation", "gravity_vector", "base_orientation"]
 
 
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class TerminationInput:
+    commands: xax.FrozenDict[str, PyTree]
+    physics_state: PhysicsState
+
+
 @attrs.define(frozen=True, kw_only=True)
 class Termination(ABC):
     """Base class for terminations."""
 
     @abstractmethod
-    def __call__(self, state: PhysicsData, curriculum_level: Array) -> Array:
+    def __call__(self, state: TerminationInput, curriculum_level: Array) -> Array:
         """Checks if the environment has terminated. Shape of output should be (num_envs).
 
         Args:
-            state: The current state of the environment.
+            state: The termination inputs, including the physics state and commands.
             curriculum_level: The current curriculum level.
 
         Returns:
@@ -63,9 +72,10 @@ class NotUprightTermination(Termination):
 
     max_radians: float = attrs.field(validator=attrs.validators.gt(0.0))
 
-    def __call__(self, state: PhysicsData, curriculum_level: Array) -> Array:
+    def __call__(self, state: TerminationInput, curriculum_level: Array) -> Array:
+        physics_data = state.physics_state.data
         gravity = jnp.array([0.0, 0.0, 1.0])
-        quat = state.qpos[..., 3:7]
+        quat = physics_data.qpos[..., 3:7]
         gravity_vec = xax.rotate_vector_by_quat(gravity, quat, inverse=True)[..., 2]
         return jnp.where(jnp.arccos(gravity_vec) > self.max_radians, -1, 0)
 
@@ -76,8 +86,9 @@ class MinimumHeightTermination(Termination):
 
     min_height: float = attrs.field(validator=attrs.validators.gt(0.0))
 
-    def __call__(self, state: PhysicsData, curriculum_level: Array) -> Array:
-        return jnp.where(state.qpos[2] < self.min_height, -1, 0)
+    def __call__(self, state: TerminationInput, curriculum_level: Array) -> Array:
+        physics_data = state.physics_state.data
+        return jnp.where(physics_data.qpos[2] < self.min_height, -1, 0)
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -87,14 +98,17 @@ class IllegalContactTermination(Termination):
     illegal_geom_idxs: jax.Array
     contact_eps: float = -0.001
 
-    def __call__(self, state: PhysicsData, curriculum_level: Array) -> Array:
-        if state.ncon == 0:
+    def __call__(self, state: TerminationInput, curriculum_level: Array) -> Array:
+        physics_data = state.physics_state.data
+        if physics_data.ncon == 0:
             return jnp.array(False)
 
-        illegal_geom1 = jnp.isin(state.contact.geom1, self.illegal_geom_idxs)
-        illegal_geom2 = jnp.isin(state.contact.geom2, self.illegal_geom_idxs)
+        illegal_geom1 = jnp.isin(physics_data.contact.geom1, self.illegal_geom_idxs)
+        illegal_geom2 = jnp.isin(physics_data.contact.geom2, self.illegal_geom_idxs)
         illegal_contact = jnp.logical_or(illegal_geom1, illegal_geom2)
-        significant_contact = jnp.where(illegal_contact, state.contact.dist < self.contact_eps, False).any()
+        significant_contact = jnp.where(
+            illegal_contact, physics_data.contact.dist < self.contact_eps, False
+        ).any()
 
         return jnp.where(significant_contact, -1, 0)
 
@@ -137,8 +151,9 @@ class BadZTermination(Termination):
     max_z: float = attrs.field()
     final_max_z: float | None = attrs.field(default=None)
 
-    def __call__(self, state: PhysicsData, curriculum_level: Array) -> Array:
-        height = state.qpos[2]
+    def __call__(self, state: TerminationInput, curriculum_level: Array) -> Array:
+        physics_data = state.physics_state.data
+        height = physics_data.qpos[2]
         final_min_z = self.min_z if self.final_min_z is None else self.final_min_z
         final_max_z = self.max_z if self.final_max_z is None else self.final_max_z
         min_z = (final_min_z - self.min_z) * curriculum_level + self.min_z
@@ -152,8 +167,9 @@ class BadVelocityTermination(Termination):
 
     max_vel: float = attrs.field()
 
-    def __call__(self, state: PhysicsData, curriculum_level: Array) -> Array:
-        lin_vel = jnp.linalg.norm(state.qvel[..., 0:3], axis=-1)
+    def __call__(self, state: TerminationInput, curriculum_level: Array) -> Array:
+        physics_data = state.physics_state.data
+        lin_vel = jnp.linalg.norm(physics_data.qvel[..., 0:3], axis=-1)
         return jnp.where(lin_vel > self.max_vel, -1, 0)
 
 
@@ -167,9 +183,12 @@ class FarFromOriginTermination(Termination):
     max_dist: float = attrs.field(validator=attrs.validators.gt(0.0))
     pos_termination: bool = attrs.field(default=True)
 
-    def __call__(self, state: PhysicsData, curriculum_level: Array) -> Array:
+    def __call__(self, state: TerminationInput, curriculum_level: Array) -> Array:
+        physics_data = state.physics_state.data
         termination_value = 1 if self.pos_termination else -1
-        return jnp.where(jnp.linalg.norm(state.qpos[..., :3], axis=-1) > self.max_dist, termination_value, 0)
+        return jnp.where(
+            jnp.linalg.norm(physics_data.qpos[..., :3], axis=-1) > self.max_dist, termination_value, 0
+        )
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -183,9 +202,10 @@ class EpisodeLengthTermination(Termination):
     disable_at_curriculum_level: int = attrs.field(default=None)
     pos_termination: bool = attrs.field(default=True)
 
-    def __call__(self, state: PhysicsData, curriculum_level: Array) -> Array:
+    def __call__(self, state: TerminationInput, curriculum_level: Array) -> Array:
+        physics_data = state.physics_state.data
         termination_value = 1 if self.pos_termination else -1
-        long_episodes = jnp.where(state.time > self.max_length_sec, termination_value, 0)
+        long_episodes = jnp.where(physics_data.time > self.max_length_sec, termination_value, 0)
         if self.disable_at_curriculum_level is not None:
             return jnp.where(curriculum_level < self.disable_at_curriculum_level, 0, long_episodes)
 
