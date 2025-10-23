@@ -349,16 +349,14 @@ def _tree_replace(physics_model: PhysicsModel, randomizations: xax.FrozenDict[st
 
 def apply_randomizations(
     physics_model: PhysicsModel,
-    engine: PhysicsEngine,
     randomizers: xax.FrozenDict[str, PhysicsRandomizer],
     curriculum_level: Array,
     rng: PRNGKeyArray,
-) -> tuple[xax.FrozenDict[str, Array], PhysicsState]:
-    rand_rng, reset_rng = jax.random.split(rng)
+) -> tuple[xax.FrozenDict[str, Array], PhysicsModel]:
+    rand_rng = rng
     randomizations = get_physics_randomizers(physics_model, randomizers, rand_rng)
     physics_model = _tree_replace(physics_model, randomizations)
-    physics_state = engine.reset(physics_model, curriculum_level, reset_rng)
-    return randomizations, physics_state
+    return randomizations, physics_model
 
 
 @jax.tree_util.register_dataclass
@@ -1079,33 +1077,42 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
             aux_outputs=action.aux_outputs,
         )
 
-        next_physics_state = jax.lax.cond(
-            done,
-            lambda: constants.engine.reset(
-                shared_state.physics_model,
-                env_states.curriculum_state.level,
-                reset_rng,
-                commands=env_states.commands,
-            ),
-            lambda: next_physics_state,
-        )
-
-        # Conditionally reset on termination.
-        next_commands = jax.lax.cond(
-            done,
-            lambda: get_initial_commands(
+        def _reset_commands(_: None) -> tuple[xax.FrozenDict[str, PyTree], xax.FrozenDict[str, PyTree]]:
+            cmds = get_initial_commands(
                 rng=cmd_rng,
                 physics_data=next_physics_state.data,
                 commands=constants.commands,
                 curriculum_level=env_states.curriculum_state.level,
-            ),
-            lambda: get_commands(
+            )
+            return cmds, cmds
+
+        def _continue_commands(_: None) -> tuple[xax.FrozenDict[str, PyTree], xax.FrozenDict[str, PyTree]]:
+            new_cmds = get_commands(
                 prev_commands=env_states.commands,
                 physics_state=next_physics_state,
                 rng=cmd_rng,
                 commands=constants.commands,
                 curriculum_level=env_states.curriculum_state.level,
+            )
+            return new_cmds, env_states.commands
+
+        next_commands, reset_commands = jax.lax.cond(
+            done,
+            _reset_commands,
+            _continue_commands,
+            operand=None,
+        )
+
+        next_physics_state = jax.lax.cond(
+            done,
+            lambda cmds: constants.engine.reset(
+                shared_state.physics_model,
+                env_states.curriculum_state.level,
+                reset_rng,
+                commands=cmds,
             ),
+            lambda _: next_physics_state,
+            reset_commands,
         )
 
         next_obs_carry = jax.lax.cond(
@@ -2195,10 +2202,11 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
             carry_obs_rng,
             command_rng,
             rand_rng,
+            reset_rng,
             rollout_rng,
             curriculum_rng,
             reward_rng,
-        ) = jax.random.split(rng, 8)
+        ) = jax.random.split(rng, 9)
 
         if isinstance(physics_model, mjx.Model):
             # Defines the vectorized initialization functions.
@@ -2232,24 +2240,49 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
             randomization_fn = apply_randomizations
             randomization_fn = xax.vmap(
                 randomization_fn,
-                in_axes=(None, None, None, 0, 0),
+                in_axes=(None, None, 0, 0),
                 jit_level=JitLevel.INITIALIZATION,
             )
-            randomization_dict, physics_state = randomization_fn(
+            randomization_dict, randomized_models = randomization_fn(
                 physics_model,
-                rollout_constants.engine,
                 randomizers,
                 curriculum_state.level,
                 jax.random.split(rand_rng, self.config.num_envs),
             )
 
-            return RolloutEnvState(
-                commands=command_fn(
-                    jax.random.split(command_rng, self.config.num_envs),
-                    physics_state.data,
-                    rollout_constants.commands,
-                    curriculum_state.level,
+            make_data_fn = xax.vmap(
+                mjx.make_data,
+                in_axes=(0,),
+                jit_level=JitLevel.INITIALIZATION,
+            )
+            command_data = make_data_fn(randomized_models)
+
+            initial_commands = command_fn(
+                jax.random.split(command_rng, self.config.num_envs),
+                command_data,
+                rollout_constants.commands,
+                curriculum_state.level,
+            )
+
+            reset_fn = xax.vmap(
+                lambda model, level, rng, cmds: rollout_constants.engine.reset(
+                    model,
+                    level,
+                    rng,
+                    commands=cmds,
                 ),
+                in_axes=(0, 0, 0, 0),
+                jit_level=JitLevel.INITIALIZATION,
+            )
+            physics_state = reset_fn(
+                randomized_models,
+                curriculum_state.level,
+                jax.random.split(reset_rng, self.config.num_envs),
+                initial_commands,
+            )
+
+            return RolloutEnvState(
+                commands=initial_commands,
                 physics_state=physics_state,
                 randomization_dict=randomization_dict,
                 model_carry=carry_fn(policy_model, jax.random.split(carry_model_rng, self.config.num_envs)),
@@ -2271,21 +2304,28 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
             curriculum_state = rollout_constants.curriculum.get_initial_state(curriculum_rng)
 
             # Gets the environment randomizations.
-            randomization_dict, physics_state = apply_randomizations(
+            randomization_dict, randomized_model = apply_randomizations(
                 physics_model,
-                rollout_constants.engine,
                 randomizers,
                 curriculum_state.level,
                 rand_rng,
             )
+            command_data = mujoco.MjData(randomized_model)  # pyright: ignore[reportCallIssue]
+            initial_commands = get_initial_commands(
+                command_rng,
+                command_data,
+                rollout_constants.commands,
+                curriculum_state.level,
+            )
+            physics_state = rollout_constants.engine.reset(
+                randomized_model,
+                curriculum_state.level,
+                reset_rng,
+                commands=initial_commands,
+            )
 
             return RolloutEnvState(
-                commands=get_initial_commands(
-                    command_rng,
-                    physics_state.data,
-                    rollout_constants.commands,
-                    curriculum_state.level,
-                ),
+                commands=initial_commands,
                 physics_state=physics_state,
                 randomization_dict=randomization_dict,
                 model_carry=self.get_initial_model_carry(policy_model, carry_model_rng),
