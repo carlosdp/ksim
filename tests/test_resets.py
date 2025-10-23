@@ -15,8 +15,13 @@ import ksim
 class DummyReset(ksim.Reset):
     """Dummy reset for testing."""
 
-    def __call__(self, data: ksim.PhysicsData, curriculum_level: Array, rng: jax.Array) -> dict[str, Array]:
-        return {"qpos": jnp.zeros((3,))}
+    def __call__(
+        self,
+        state: ksim.ResetInput,
+        curriculum_level: Array,
+        rng: jax.Array,
+    ) -> ksim.PhysicsState:
+        return state.physics_state
 
 
 class DummyMjxData:
@@ -58,10 +63,19 @@ class TestXYPositionResetBuilder:
         reset = ksim.get_xy_position_reset(humanoid_model)
         data = DummyMjxData()
         curriculum_level = jnp.array(0.0)
-        result = reset(data, curriculum_level, rng)
+        physics_state = ksim.PhysicsState(
+            data=data,
+            most_recent_action=jnp.zeros((0,)),
+            event_states=xax.freeze_dict({}),
+            actuator_state=None,
+            action_latency=jnp.array(0.0),
+        )
+        reset_input = ksim.ResetInput(commands=xax.freeze_dict({}), physics_state=physics_state)
+        result_state = reset(reset_input, curriculum_level, rng)
 
-        # Check that the result is a DummyMjxData object
-        assert isinstance(result, DummyMjxData)
+        # Check that the result is a PhysicsState with DummyMjxData data
+        assert isinstance(result_state, ksim.PhysicsState)
+        assert isinstance(result_state.data, DummyMjxData)
 
 
 @pytest.mark.parametrize(

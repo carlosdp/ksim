@@ -27,7 +27,7 @@ from mujoco import mjx
 from ksim.actuators import Actuators, StatefulActuators
 from ksim.debugging import JitLevel
 from ksim.events import Event
-from ksim.resets import Reset
+from ksim.resets import Reset, ResetInput
 from ksim.types import PhysicsModel, PhysicsState
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,13 @@ class PhysicsEngine(eqx.Module, ABC):
     phys_steps_per_actuator_step: int = eqx.field()
 
     @abstractmethod
-    def reset(self, physics_model: PhysicsModel, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
+    def reset(
+        self,
+        physics_model: PhysicsModel,
+        curriculum_level: Array,
+        rng: PRNGKeyArray,
+        commands: xax.FrozenDict[str, PyTree] | None = None,
+    ) -> PhysicsState:
         """Reset the engine and return the physics data."""
 
     @abstractmethod
@@ -74,13 +80,31 @@ class MjxEngine(PhysicsEngine):
     """Defines an engine for MJX models."""
 
     @xax.jit(static_argnames=["self"])
-    def reset(self, physics_model: mjx.Model, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
+    def reset(
+        self,
+        physics_model: mjx.Model,
+        curriculum_level: Array,
+        rng: PRNGKeyArray,
+        commands: xax.FrozenDict[str, PyTree] | None = None,
+    ) -> PhysicsState:
+        commands = xax.freeze_dict({}) if commands is None else commands
         mjx_data = mjx.make_data(physics_model)
+
+        physics_state = PhysicsState(
+            data=mjx_data,
+            most_recent_action=mjx_data.ctrl,
+            event_states=xax.freeze_dict({}),
+            actuator_state=None,
+            action_latency=jnp.zeros_like(curriculum_level),
+        )
+        reset_state = ResetInput(commands=commands, physics_state=physics_state)
 
         for reset in self.resets:
             rng, reset_rng = jax.random.split(rng)
-            mjx_data = reset(mjx_data, curriculum_level, reset_rng)
+            physics_state = reset(reset_state, curriculum_level, reset_rng)
+            reset_state = ResetInput(commands=reset_state.commands, physics_state=physics_state)
 
+        mjx_data = physics_state.data
         mjx_data = mjx.forward(physics_model, mjx_data)
         assert isinstance(mjx_data, mjx.Data)
 
@@ -227,12 +251,31 @@ class MjxEngine(PhysicsEngine):
 class MujocoEngine(PhysicsEngine):
     """Defines an engine for MuJoCo models."""
 
-    def reset(self, physics_model: mujoco.MjModel, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
+    def reset(
+        self,
+        physics_model: mujoco.MjModel,
+        curriculum_level: Array,
+        rng: PRNGKeyArray,
+        commands: xax.FrozenDict[str, PyTree] | None = None,
+    ) -> PhysicsState:
+        commands = xax.freeze_dict({}) if commands is None else commands
         mj_data = mujoco.MjData(physics_model)
+
+        physics_state = PhysicsState(
+            data=mj_data,
+            most_recent_action=mj_data.ctrl.copy(),
+            event_states=xax.freeze_dict({}),
+            actuator_state=None,
+            action_latency=jnp.zeros_like(curriculum_level),
+        )
+        reset_state = ResetInput(commands=commands, physics_state=physics_state)
 
         for reset in self.resets:
             rng, reset_rng = jax.random.split(rng)
-            mj_data = reset(mj_data, curriculum_level, reset_rng)
+            physics_state = reset(reset_state, curriculum_level, reset_rng)
+            reset_state = ResetInput(commands=reset_state.commands, physics_state=physics_state)
+
+        mj_data = physics_state.data
 
         mujoco.mj_forward(physics_model, mj_data)
 

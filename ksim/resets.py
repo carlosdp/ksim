@@ -2,6 +2,7 @@
 
 __all__ = [
     "Reset",
+    "ResetInput",
     "HFieldXYPositionReset",
     "InitialMotionStateReset",
     "PlaneXYPositionReset",
@@ -16,20 +17,28 @@ __all__ = [
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, replace
 
 import attrs
 import jax
 import jax.numpy as jnp
 import mujoco
 import xax
-from jaxtyping import Array, PRNGKeyArray
+from jaxtyping import Array, PRNGKeyArray, PyTree
 from mujoco import mjx
 
-from ksim.types import PhysicsData, PhysicsModel
+from ksim.types import PhysicsModel, PhysicsState
 from ksim.utils.mujoco import get_joint_names_in_order, get_position_limits, slice_update, update_data_field
 from ksim.utils.priors import MotionReferenceData
 
 logger = logging.getLogger(__name__)
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class ResetInput:
+    commands: xax.FrozenDict[str, PyTree]
+    physics_state: PhysicsState
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -37,7 +46,7 @@ class Reset(ABC):
     """Base class for resets."""
 
     @abstractmethod
-    def __call__(self, data: PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsData:
+    def __call__(self, state: ResetInput, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
         """Resets the environment."""
 
 
@@ -52,8 +61,9 @@ class HFieldXYPositionReset(Reset):
     hfield_data: xax.HashableArray
     robot_base_height: float = attrs.field(default=0.0)
 
-    def __call__(self, data: PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsData:
+    def __call__(self, state: ResetInput, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
         x_bound, y_bound, z_top, _ = self.bounds
+        physics_data = state.physics_state.data
 
         # Unpack padded bounds.
         lower_x, upper_x, lower_y, upper_y = self.padded_bounds
@@ -65,7 +75,7 @@ class HFieldXYPositionReset(Reset):
         new_x = jnp.clip(offset_x, lower_x, upper_x)
         new_y = jnp.clip(offset_y, lower_y, upper_y)
 
-        qpos_j = data.qpos
+        qpos_j = physics_data.qpos
         qpos_j = qpos_j.at[0:1].set(new_x)
         qpos_j = qpos_j.at[1:2].set(new_y)
 
@@ -85,8 +95,8 @@ class HFieldXYPositionReset(Reset):
         # Get the height from the heightfield and add the z offset.
         z = self.hfield_data.array[x_idx, y_idx]
         qpos_j = qpos_j.at[2:3].set(z + z_top + self.robot_base_height)
-        data = update_data_field(data, "qpos", qpos_j)
-        return data
+        physics_data = update_data_field(physics_data, "qpos", qpos_j)
+        return replace(state.physics_state, data=physics_data)
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -99,8 +109,9 @@ class PlaneXYPositionReset(Reset):
     y_range: float = attrs.field(default=5.0)
     robot_base_height: float = attrs.field(default=0.0)
 
-    def __call__(self, data: PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsData:
+    def __call__(self, state: ResetInput, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
         _, _, z_pos = self.bounds
+        physics_data = state.physics_state.data
 
         lower_x, upper_x, lower_y, upper_y = self.padded_bounds
 
@@ -111,12 +122,12 @@ class PlaneXYPositionReset(Reset):
         new_x = jnp.clip(offset_x, lower_x, upper_x)
         new_y = jnp.clip(offset_y, lower_y, upper_y)
 
-        qpos_j = data.qpos
+        qpos_j = physics_data.qpos
         qpos_j = qpos_j.at[0:1].set(new_x)
         qpos_j = qpos_j.at[1:2].set(new_y)
         qpos_j = qpos_j.at[2:3].set(z_pos + self.robot_base_height)
-        data = update_data_field(data, "qpos", qpos_j)
-        return data
+        physics_data = update_data_field(physics_data, "qpos", qpos_j)
+        return replace(state.physics_state, data=physics_data)
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -129,8 +140,9 @@ class RandomJointPositionReset(Reset):
     mins: tuple[float, ...] | None = attrs.field(default=None)
     maxs: tuple[float, ...] | None = attrs.field(default=None)
 
-    def __call__(self, data: PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsData:
-        pos = jax.random.uniform(rng, data.qpos[7:].shape, minval=-self.scale, maxval=self.scale)
+    def __call__(self, state: ResetInput, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
+        physics_data = state.physics_state.data
+        pos = jax.random.uniform(rng, physics_data.qpos[7:].shape, minval=-self.scale, maxval=self.scale)
         if self.scale_by_curriculum:
             pos = pos * curriculum_level
         if self.zeros is not None:
@@ -139,9 +151,9 @@ class RandomJointPositionReset(Reset):
             pos = jnp.clip(pos, min=jnp.array(self.mins))
         if self.maxs is not None:
             pos = jnp.clip(pos, max=jnp.array(self.maxs))
-        new_qpos = jnp.concatenate([data.qpos[:7], pos])
-        data = update_data_field(data, "qpos", new_qpos)
-        return data
+        new_qpos = jnp.concatenate([physics_data.qpos[:7], pos])
+        physics_data = update_data_field(physics_data, "qpos", new_qpos)
+        return replace(state.physics_state, data=physics_data)
 
     @classmethod
     def create(
@@ -180,13 +192,14 @@ class RandomJointVelocityReset(Reset):
     scale: float = attrs.field(default=0.01)
     scale_by_curriculum: bool = attrs.field(default=True)
 
-    def __call__(self, data: PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsData:
-        noise = jax.random.uniform(rng, data.qvel[6:].shape, minval=-self.scale, maxval=self.scale)
+    def __call__(self, state: ResetInput, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
+        physics_data = state.physics_state.data
+        noise = jax.random.uniform(rng, physics_data.qvel[6:].shape, minval=-self.scale, maxval=self.scale)
         if self.scale_by_curriculum:
             noise = noise * curriculum_level
-        new_qvel = jnp.concatenate([data.qvel[:6], noise])
-        data = update_data_field(data, "qvel", new_qvel)
-        return data
+        new_qvel = jnp.concatenate([physics_data.qvel[:6], noise])
+        physics_data = update_data_field(physics_data, "qvel", new_qvel)
+        return replace(state.physics_state, data=physics_data)
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -195,16 +208,17 @@ class RandomBaseVelocityXYReset(Reset):
 
     scale: float = attrs.field(default=0.01)
 
-    def __call__(self, data: PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsData:
-        qvel = data.qvel
+    def __call__(self, state: ResetInput, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
+        physics_data = state.physics_state.data
+        qvel = physics_data.qvel
         noise = jax.random.uniform(rng, qvel[0:2].shape, minval=-self.scale, maxval=self.scale) * curriculum_level
-        match type(data):
+        match type(physics_data):
             case mujoco.MjData:
                 qvel[0:2] = noise
             case mjx.Data:
-                qvel.at[0:2].set(noise)
-        data = update_data_field(data, "qvel", qvel)
-        return data
+                qvel = qvel.at[0:2].set(noise)
+        physics_data = update_data_field(physics_data, "qvel", qvel)
+        return replace(state.physics_state, data=physics_data)
 
 
 def get_xy_position_reset(
@@ -287,36 +301,38 @@ class InitialMotionStateReset(Reset):
     reference_motion: MotionReferenceData
     freejoint: bool = attrs.field(default=False)
 
-    def __call__(self, data: PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsData:
+    def __call__(self, state: ResetInput, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
+        physics_data = state.physics_state.data
         frame_index = jax.random.randint(rng, (1,), 0, self.reference_motion.num_frames)[0]
         qpos = self.reference_motion.get_qpos_at_step(frame_index)
         qvel = self.reference_motion.get_qvel_at_step(frame_index)
 
         if self.freejoint:
-            data = update_data_field(data, "qpos", qpos)
-            data = update_data_field(data, "qvel", qvel)
+            physics_data = update_data_field(physics_data, "qpos", qpos)
+            physics_data = update_data_field(physics_data, "qvel", qvel)
         else:
-            new_qpos = jnp.concatenate([data.qpos[:7], qpos[7:]])
-            data = update_data_field(data, "qpos", new_qpos)
-            new_qvel = jnp.concatenate([data.qvel[:6], qvel[7:]])
-            data = update_data_field(data, "qvel", new_qvel)
+            new_qpos = jnp.concatenate([physics_data.qpos[:7], qpos[7:]])
+            physics_data = update_data_field(physics_data, "qpos", new_qpos)
+            new_qvel = jnp.concatenate([physics_data.qvel[:6], qvel[7:]])
+            physics_data = update_data_field(physics_data, "qvel", new_qvel)
 
-        data = update_data_field(data, "time", frame_index * self.reference_motion.ctrl_dt)
-        return data
+        physics_data = update_data_field(physics_data, "time", frame_index * self.reference_motion.ctrl_dt)
+        return replace(state.physics_state, data=physics_data)
 
 
 @attrs.define(frozen=True, kw_only=True)
 class RandomHeadingReset(Reset):
     """Resets the heading of the robot to a random value."""
 
-    def __call__(self, data: PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsData:
-        angle = jax.random.uniform(rng, data.qpos.shape[:-1], minval=-jnp.pi, maxval=jnp.pi)
+    def __call__(self, state: ResetInput, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
+        physics_data = state.physics_state.data
+        angle = jax.random.uniform(rng, physics_data.qpos.shape[:-1], minval=-jnp.pi, maxval=jnp.pi)
         euler = jnp.stack([jnp.zeros_like(angle), jnp.zeros_like(angle), angle], axis=-1)
         new_quat = xax.euler_to_quat(euler)
-        quat = xax.quat_mul(data.qpos[..., 3:7], new_quat)
-        qpos = slice_update(data, "qpos", slice(3, 7), quat)
-        data = update_data_field(data, "qpos", qpos)
-        return data
+        quat = xax.quat_mul(physics_data.qpos[..., 3:7], new_quat)
+        qpos = slice_update(physics_data, "qpos", slice(3, 7), quat)
+        physics_data = update_data_field(physics_data, "qpos", qpos)
+        return replace(state.physics_state, data=physics_data)
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -325,13 +341,14 @@ class RandomHeightReset(Reset):
 
     range: tuple[float, float] = attrs.field(default=(0.0, 0.1))
 
-    def __call__(self, data: PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsData:
-        qpos = data.qpos
+    def __call__(self, state: ResetInput, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
+        physics_data = state.physics_state.data
+        qpos = physics_data.qpos
         min_height, max_height = self.range
         new_z = jax.random.uniform(rng, qpos[..., 2:3].shape, minval=min_height, maxval=max_height)
-        qpos = slice_update(data, "qpos", slice(2, 3), qpos[..., 2:3] + new_z)
-        data = update_data_field(data, "qpos", qpos)
-        return data
+        qpos = slice_update(physics_data, "qpos", slice(2, 3), qpos[..., 2:3] + new_z)
+        physics_data = update_data_field(physics_data, "qpos", qpos)
+        return replace(state.physics_state, data=physics_data)
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -341,14 +358,15 @@ class RandomPitchRollReset(Reset):
     pitch_range: tuple[float, float] = attrs.field(default=(-0.1, 0.1))
     roll_range: tuple[float, float] = attrs.field(default=(-0.1, 0.1))
 
-    def __call__(self, data: PhysicsData, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsData:
-        qpos = data.qpos
+    def __call__(self, state: ResetInput, curriculum_level: Array, rng: PRNGKeyArray) -> PhysicsState:
+        physics_data = state.physics_state.data
+        qpos = physics_data.qpos
         min_pitch, max_pitch = self.pitch_range
         min_roll, max_roll = self.roll_range
         pitch = jax.random.uniform(rng, qpos[..., 0].shape, minval=min_pitch, maxval=max_pitch)
         roll = jax.random.uniform(rng, qpos[..., 0].shape, minval=min_roll, maxval=max_roll)
         quat = xax.euler_to_quat(jnp.stack([roll, pitch, jnp.zeros_like(pitch)], axis=-1))
-        new_quat = xax.quat_mul(data.qpos[..., 3:7], quat)
-        qpos = slice_update(data, "qpos", slice(3, 7), new_quat)
-        data = update_data_field(data, "qpos", qpos)
-        return data
+        new_quat = xax.quat_mul(physics_data.qpos[..., 3:7], quat)
+        qpos = slice_update(physics_data, "qpos", slice(3, 7), new_quat)
+        physics_data = update_data_field(physics_data, "qpos", qpos)
+        return replace(state.physics_state, data=physics_data)

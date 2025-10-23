@@ -1085,6 +1085,7 @@ class RLTask(xax.Task[Config, InitParams], Generic[Config], ABC):
                 shared_state.physics_model,
                 env_states.curriculum_state.level,
                 reset_rng,
+                commands=env_states.commands,
             ),
             lambda: next_physics_state,
         )
