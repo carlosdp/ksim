@@ -25,7 +25,11 @@ import optax
 import tqdm
 import xax
 from jaxtyping import Array, PRNGKeyArray, PyTree
-from kmv.app.viewer import DefaultMujocoViewer, QtViewer
+try:
+    from kmv.app.viewer import DefaultMujocoViewer, QtViewer
+except Exception:  # pragma: no cover
+    DefaultMujocoViewer = None  # type: ignore[assignment]
+    QtViewer = None  # type: ignore[assignment]
 from omegaconf import DictConfig, OmegaConf
 
 from ksim.debugging import JitLevel

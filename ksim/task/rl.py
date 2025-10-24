@@ -43,7 +43,11 @@ from dpshdl.dataset import Dataset
 from jax.core import get_aval
 from jax.typing import ArrayLike
 from jaxtyping import Array, PRNGKeyArray, PyTree
-from kmv.app.viewer import DefaultMujocoViewer, QtViewer
+try:
+    from kmv.app.viewer import DefaultMujocoViewer, QtViewer
+except Exception:  # pragma: no cover
+    DefaultMujocoViewer = None  # type: ignore[assignment]
+    QtViewer = None  # type: ignore[assignment]
 from kmv.core.types import RenderMode, Marker as KMVMarker, GeomType
 from mujoco import mjx
 from omegaconf import MISSING
@@ -615,6 +619,8 @@ def get_qt_viewer(
     save_path: str | Path | None = None,
     mode: RenderMode | None = None,
 ) -> QtViewer:
+    if QtViewer is None:
+        raise RuntimeError("QtViewer is unavailable in this environment. Install GUI/GL dependencies.")
     return QtViewer(
         mj_model,
         mode=(mode if mode is not None else "window" if save_path is None else "offscreen"),
@@ -640,6 +646,8 @@ def get_default_viewer(
     width: int | None = None,
     height: int | None = None,
 ) -> DefaultMujocoViewer:
+    if DefaultMujocoViewer is None:
+        raise RuntimeError("DefaultMujocoViewer is unavailable in this environment. Install GUI/GL dependencies.")
     viewer = DefaultMujocoViewer(
         mj_model,
         width=width or config.render_width,
