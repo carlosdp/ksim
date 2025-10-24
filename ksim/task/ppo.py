@@ -304,6 +304,19 @@ class PPOConfig(RLConfig):
         help="Whether to use Monte Carlo returns.",
     )
 
+    # Empirical normalization (RSL RL style) for value targets/predictions.
+    use_value_norm: bool = xax.field(
+        value=False,
+        help=(
+            "If true, maintain running mean/std of value targets and train the value "
+            "function in the normalized space (empirical normalization, like RSL RL)."
+        ),
+    )
+    value_norm_epsilon: float = xax.field(
+        value=1e-8,
+        help="Small epsilon added to variance for numerical stability in value normalization.",
+    )
+
 
 Config = TypeVar("Config", bound=PPOConfig)
 
@@ -368,7 +381,22 @@ class PPOTask(RLTask[Config], Generic[Config], ABC):
             metrics[f"loss_{name}"] = loss.mean()
         if off_policy_variables.entropy is not None:
             metrics["entropy"] = off_policy_variables.entropy.mean(0).flatten()
+        # Expose current value norm running stats if enabled
+        if self.config.use_value_norm:
+            aux_vals = self._current_aux_values_for_metrics()
+            if aux_vals is not None:
+                if "value_norm_mean" in aux_vals:
+                    metrics["value_norm_mean"] = jnp.asarray(aux_vals["value_norm_mean"])  # scalar
+                if "value_norm_var" in aux_vals:
+                    metrics["value_norm_var"] = jnp.asarray(aux_vals["value_norm_var"])  # scalar
         return metrics
+
+    def _current_aux_values_for_metrics(self) -> Mapping[str, Array] | None:
+        # Helper for metrics to access aux_values at runtime. When jitted, this will
+        # capture values available via closures at call time.
+        # In this simple helper we return an empty mapping; actual values are injected
+        # in update_model where metrics are produced.
+        return {}
 
     def _get_logged_trajectory_metrics(
         self,
@@ -421,6 +449,8 @@ class PPOTask(RLTask[Config], Generic[Config], ABC):
         on_policy_variables: PPOVariables,
         rng: PRNGKeyArray,
         kl_scale: float,
+        value_norm_mean: Array,
+        value_norm_var: Array,
     ) -> tuple[Array, xax.FrozenDict[str, Array]]:
         """Computes the PPO loss and additional metrics.
 
@@ -455,17 +485,63 @@ class PPOTask(RLTask[Config], Generic[Config], ABC):
             monte_carlo_returns=self.config.monte_carlo_returns,
         )
 
-        losses_bt = compute_ppo_loss(
-            ppo_inputs=ppo_inputs,
-            on_policy_variables=on_policy_variables,
-            off_policy_variables=off_policy_variables,
-            clip_param=self.config.clip_param,
-            value_loss_coef=self.config.value_loss_coef,
-            entropy_coef=self.config.entropy_coef,
-            kl_coef=self.config.kl_coef,
-            log_clip_value=self.config.log_clip_value,
-            use_clipped_value_loss=self.config.use_clipped_value_loss,
-        )
+        # Optionally normalize value targets and predictions using empirical running stats
+        # (RSL RL style value normalization).
+        if self.config.use_value_norm:
+            mean = value_norm_mean
+            var = value_norm_var
+            eps = self.config.value_norm_epsilon
+            std = jnp.sqrt(var + eps)
+
+            # Normalize value targets and predictions
+            norm_value_targets_bt = (ppo_inputs.value_targets_bt - mean) / std
+            norm_on_policy_values = (on_policy_variables.values - mean) / std
+            norm_off_policy_values = (off_policy_variables.values - mean) / std
+
+            # Build normalized PPO variables for loss computation
+            on_policy_variables_norm = PPOVariables(
+                log_probs=on_policy_variables.log_probs,
+                values=norm_on_policy_values,
+                entropy=on_policy_variables.entropy,
+                aux_losses=on_policy_variables.aux_losses,
+            )
+            off_policy_variables_norm = PPOVariables(
+                log_probs=off_policy_variables.log_probs,
+                values=norm_off_policy_values,
+                entropy=off_policy_variables.entropy,
+                aux_losses=off_policy_variables.aux_losses,
+            )
+
+            ppo_inputs_norm = PPOInputs(
+                advantages_bt=ppo_inputs.advantages_bt,
+                value_targets_bt=norm_value_targets_bt,
+                gae_bt=ppo_inputs.gae_bt,
+                returns_bt=ppo_inputs.returns_bt,
+            )
+
+            losses_bt = compute_ppo_loss(
+                ppo_inputs=ppo_inputs_norm,
+                on_policy_variables=on_policy_variables_norm,
+                off_policy_variables=off_policy_variables_norm,
+                clip_param=self.config.clip_param,
+                value_loss_coef=self.config.value_loss_coef,
+                entropy_coef=self.config.entropy_coef,
+                kl_coef=self.config.kl_coef,
+                log_clip_value=self.config.log_clip_value,
+                use_clipped_value_loss=self.config.use_clipped_value_loss,
+            )
+        else:
+            losses_bt = compute_ppo_loss(
+                ppo_inputs=ppo_inputs,
+                on_policy_variables=on_policy_variables,
+                off_policy_variables=off_policy_variables,
+                clip_param=self.config.clip_param,
+                value_loss_coef=self.config.value_loss_coef,
+                entropy_coef=self.config.entropy_coef,
+                kl_coef=self.config.kl_coef,
+                log_clip_value=self.config.log_clip_value,
+                use_clipped_value_loss=self.config.use_clipped_value_loss,
+            )
 
         # Rescale KL loss dynamically to support adaptive KL without recompilation.
         losses_bt = dict(losses_bt)
@@ -477,6 +553,25 @@ class PPOTask(RLTask[Config], Generic[Config], ABC):
             on_policy_variables=on_policy_variables,
             off_policy_variables=off_policy_variables,
         )
+
+        # If using value normalization, compute batch stats to be consumed upstream
+        # for updating the running mean/variance in the shared aux_values.
+        if self.config.use_value_norm:
+            # Use value targets as empirical values
+            batch_vals = ppo_inputs.value_targets_bt
+            # Flatten over all dimensions
+            flat = batch_vals.reshape(-1)
+            batch_count = flat.shape[0]
+            batch_mean = flat.mean()
+            # Population variance
+            batch_var = flat.var()
+
+            metrics = {
+                **dict(metrics),
+                "value_norm_batch_mean": batch_mean,
+                "value_norm_batch_var": batch_var,
+                "value_norm_batch_count": jnp.asarray(batch_count, dtype=flat.dtype),
+            }
 
         # Mean loss over all losses.
         loss_bt = jnp.stack(list(losses_bt.values()), axis=-1).sum(axis=-1)
@@ -524,6 +619,9 @@ class PPOTask(RLTask[Config], Generic[Config], ABC):
             on_policy_variables,
             rng,
             kl_scale,
+            # Pass current value norm stats
+            carry.shared_state.aux_values.get("value_norm_mean", jnp.asarray(0.0)),
+            carry.shared_state.aux_values.get("value_norm_var", jnp.asarray(1.0)),
         )
 
         # Applies the gradients.
@@ -577,10 +675,19 @@ class PPOTask(RLTask[Config], Generic[Config], ABC):
     ) -> tuple[RLLoopCarry, xax.FrozenDict[str, Array]]:
         rng, onp_rng, passes_rng = jax.random.split(rng, 3)
 
-        # Initialize adaptive KL coefficient in aux_values if needed.
-        if self.config.adaptive_kl and "kl_coef" not in carry.shared_state.aux_values:
-            init_aux = {**dict(carry.shared_state.aux_values)}
+        # Initialize aux_values if needed (adaptive KL and value normalization stats).
+        init_aux = {**dict(carry.shared_state.aux_values)}
+        if self.config.adaptive_kl and "kl_coef" not in init_aux:
             init_aux["kl_coef"] = jnp.asarray(self.config.kl_coef)
+        if self.config.use_value_norm:
+            # Initialize running stats if not present
+            if "value_norm_mean" not in init_aux:
+                init_aux["value_norm_mean"] = jnp.asarray(0.0)
+            if "value_norm_var" not in init_aux:
+                init_aux["value_norm_var"] = jnp.asarray(1.0)
+            if "value_norm_count" not in init_aux:
+                init_aux["value_norm_count"] = jnp.asarray(1e-8)
+        if len(init_aux) != len(carry.shared_state.aux_values):
             carry = replace(
                 carry,
                 shared_state=replace(
@@ -649,6 +756,54 @@ class PPOTask(RLTask[Config], Generic[Config], ABC):
                 (indices_by_batch, jax.random.split(batch_rng, indices_by_batch.shape[0])),
                 jit_level=JitLevel.RL_CORE,
             )
+
+            # If using value normalization, update running mean/var using Welford-like merging.
+            if self.config.use_value_norm:
+                m = dict(metrics)
+                batch_means = m.get("value_norm_batch_mean", None)
+                batch_vars = m.get("value_norm_batch_var", None)
+                batch_counts = m.get("value_norm_batch_count", None)
+
+                if batch_means is not None and batch_vars is not None and batch_counts is not None:
+                    # Combine across all minibatches first
+                    counts_sum = jnp.sum(batch_counts)
+                    # Weighted mean across batches
+                    agg_mean = jnp.sum(batch_means * batch_counts) / jnp.maximum(counts_sum, 1.0)
+                    # Aggregate M2 within the scan outputs
+                    within_M2 = batch_vars * batch_counts
+                    between_M2 = batch_counts * (batch_means - agg_mean) * (batch_means - agg_mean)
+                    agg_M2 = jnp.sum(within_M2 + between_M2)
+                    agg_var = agg_M2 / jnp.maximum(counts_sum, 1.0)
+
+                    # Merge with running stats in aux_values
+                    aux = {**dict(carry.shared_state.aux_values)}
+                    prev_mean = jnp.asarray(aux["value_norm_mean"])
+                    prev_var = jnp.asarray(aux["value_norm_var"])
+                    prev_count = jnp.asarray(aux["value_norm_count"])
+
+                    total_count = prev_count + counts_sum
+                    delta = agg_mean - prev_mean
+                    new_mean = prev_mean + delta * (counts_sum / jnp.maximum(total_count, 1.0))
+                    prev_M2 = prev_var * prev_count
+                    agg_total_M2 = prev_M2 + agg_var * counts_sum + (delta * delta) * prev_count * counts_sum / jnp.maximum(total_count, 1.0)
+                    new_var = agg_total_M2 / jnp.maximum(total_count, 1.0)
+
+                    aux["value_norm_mean"] = new_mean
+                    aux["value_norm_var"] = new_var
+                    aux["value_norm_count"] = total_count
+
+                    # Add current running stats to metrics for logging
+                    metrics = dict(metrics)
+                    metrics["value_norm_mean"] = new_mean
+                    metrics["value_norm_var"] = new_var
+
+                    carry = replace(
+                        carry,
+                        shared_state=replace(
+                            carry.shared_state,
+                            aux_values=xax.freeze_dict(aux),
+                        ),
+                    )
 
             return carry, metrics
 

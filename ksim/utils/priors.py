@@ -34,7 +34,11 @@ import numpy as np
 import xax
 from bvhio.lib.hierarchy import Joint as BvhioJoint
 from jaxtyping import Array
-from kmv.app.viewer import QtViewer
+try:
+    # Optional dependency used only for interactive visualization utilities.
+    from kmv.app.viewer import QtViewer
+except Exception:  # pragma: no cover - environment may lack GUI/GL drivers
+    QtViewer = None  # type: ignore[assignment]
 from omegaconf import MISSING, DictConfig, ListConfig, OmegaConf
 from omegaconf.errors import ConfigKeyError, MissingMandatoryValue
 from scipy.optimize import least_squares
@@ -284,6 +288,8 @@ def visualize_reference_motion(
     mj_base_id: int,
 ) -> None:
     """Visualizes a given reference motion with the Mujoco viewer."""
+    if QtViewer is None:
+        raise RuntimeError("QtViewer is unavailable. Install GUI dependencies to use visualization.")
     data = mujoco.MjData(model)
     mujoco.mj_resetData(model, data)
 
