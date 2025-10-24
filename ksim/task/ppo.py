@@ -5,6 +5,9 @@ __all__ = [
     "PPOTask",
     "PPOInputs",
     "PPOVariables",
+    "EmpiricalNormalizationState",
+    "update_empirical_normalization_state",
+    "apply_empirical_normalization",
 ]
 
 from abc import ABC, abstractmethod
@@ -30,6 +33,15 @@ class PPOInputs:
     value_targets_bt: Array
     gae_bt: Array
     returns_bt: Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass
+class EmpiricalNormalizationState:
+    """Running statistics for empirical normalization."""
+    mean: Array
+    var: Array
+    count: Array
 
 
 @jax.tree_util.register_dataclass
@@ -245,6 +257,73 @@ def compute_ppo_loss(
     return losses
 
 
+@xax.jit(jit_level=JitLevel.HELPER_FUNCTIONS)
+def update_empirical_normalization_state(
+    state: EmpiricalNormalizationState,
+    new_data: Array,
+) -> EmpiricalNormalizationState:
+    """Updates running statistics using Welford's online algorithm.
+    
+    This matches RSL RL's implementation of empirical normalization.
+    
+    Args:
+        state: The current normalization state.
+        new_data: New batch of data with shape (batch_size, ..., feature_dim).
+        
+    Returns:
+        Updated normalization state.
+    """
+    # Flatten all dimensions except the last one
+    batch_shape = new_data.shape[:-1]
+    feature_dim = new_data.shape[-1]
+    new_data_flat = new_data.reshape(-1, feature_dim)
+    
+    batch_count = new_data_flat.shape[0]
+    batch_mean = new_data_flat.mean(axis=0)
+    batch_var = new_data_flat.var(axis=0)
+    
+    # Update count
+    new_count = state.count + batch_count
+    
+    # Update mean using weighted average
+    delta = batch_mean - state.mean
+    new_mean = state.mean + delta * batch_count / new_count
+    
+    # Update variance using parallel algorithm
+    m_a = state.var * state.count
+    m_b = batch_var * batch_count
+    M2 = m_a + m_b + delta**2 * state.count * batch_count / new_count
+    new_var = M2 / new_count
+    
+    return EmpiricalNormalizationState(
+        mean=new_mean,
+        var=new_var,
+        count=new_count,
+    )
+
+
+@xax.jit(static_argnames=["eps"], jit_level=JitLevel.HELPER_FUNCTIONS)
+def apply_empirical_normalization(
+    data: Array,
+    state: EmpiricalNormalizationState,
+    eps: float = 1e-8,
+) -> Array:
+    """Applies normalization to data using running statistics.
+    
+    This matches RSL RL's implementation of empirical normalization.
+    
+    Args:
+        data: Data to normalize with shape (..., feature_dim).
+        state: The normalization state.
+        eps: Small constant for numerical stability.
+        
+    Returns:
+        Normalized data with the same shape as input.
+    """
+    std = jnp.sqrt(state.var + eps)
+    return (data - state.mean) / std
+
+
 @jax.tree_util.register_dataclass
 @dataclass
 class PPOConfig(RLConfig):
@@ -303,6 +382,12 @@ class PPOConfig(RLConfig):
         value=False,
         help="Whether to use Monte Carlo returns.",
     )
+    
+    # Empirical normalization parameters.
+    empirical_normalization: bool = xax.field(
+        value=False,
+        help="Whether to use empirical normalization for observations.",
+    )
 
 
 Config = TypeVar("Config", bound=PPOConfig)
@@ -330,6 +415,49 @@ class PPOTask(RLTask[Config], Generic[Config], ABC):
         Returns:
             The PPO variables and the next carry for the model.
         """
+
+    def get_critic_obs(
+        self,
+        observations: xax.FrozenDict[str, PyTree],
+        commands: xax.FrozenDict[str, PyTree],
+    ) -> Array:
+        """Gets the observation vector for the critic.
+        
+        Tasks should override this method if they use empirical normalization.
+        The default implementation raises an error to remind users to implement it.
+        
+        Args:
+            observations: The observations dict.
+            commands: The commands dict.
+            
+        Returns:
+            The flattened observation vector for the critic.
+        """
+        if self.config.empirical_normalization:
+            raise NotImplementedError(
+                "When using empirical_normalization=True, tasks must implement get_critic_obs() "
+                "to return the observation vector that goes into the critic."
+            )
+        return jnp.array([])  # Dummy return for when normalization is disabled
+    
+    def normalize_critic_obs(
+        self,
+        obs: Array,
+        norm_state: EmpiricalNormalizationState,
+    ) -> Array:
+        """Normalizes critic observations using empirical normalization.
+        
+        This method should be called by tasks in their run_critic method
+        when empirical_normalization is enabled.
+        
+        Args:
+            obs: The observation vector to normalize.
+            norm_state: The normalization state from aux_values.
+            
+        Returns:
+            Normalized observation vector.
+        """
+        return apply_empirical_normalization(obs, norm_state)
 
     def get_ppo_metrics(
         self,
@@ -588,6 +716,28 @@ class PPOTask(RLTask[Config], Generic[Config], ABC):
                     aux_values=xax.freeze_dict(init_aux),
                 ),
             )
+        
+        # Initialize empirical normalization state if needed.
+        if self.config.empirical_normalization and "obs_norm_state" not in carry.shared_state.aux_values:
+            # Get a sample observation to determine dimensionality
+            # We use the first trajectory's first timestep's observation
+            sample_obs_dict = jax.tree.map(lambda x: x[0, 0], trajectories.obs)
+            sample_cmd_dict = jax.tree.map(lambda x: x[0, 0], trajectories.command)
+            sample_obs = self.get_critic_obs(sample_obs_dict, sample_cmd_dict)
+            obs_dim = sample_obs.shape[-1]
+            init_aux = {**dict(carry.shared_state.aux_values)}
+            init_aux["obs_norm_state"] = EmpiricalNormalizationState(
+                mean=jnp.zeros(obs_dim),
+                var=jnp.ones(obs_dim),
+                count=jnp.array(1e-4),
+            )
+            carry = replace(
+                carry,
+                shared_state=replace(
+                    carry.shared_state,
+                    aux_values=xax.freeze_dict(init_aux),
+                ),
+            )
 
         # Gets the policy model.
         policy_model_arr = carry.shared_state.model_arrs[0]
@@ -599,6 +749,33 @@ class PPOTask(RLTask[Config], Generic[Config], ABC):
         ppo_fn = xax.vmap(self.get_ppo_variables, in_axes=(None, 0, 0, 0), jit_level=JitLevel.RL_CORE)
         on_policy_variables, _ = ppo_fn(policy_model, trajectories, carry.env_states.model_carry, on_policy_rngs)
         on_policy_variables = jax.lax.stop_gradient(on_policy_variables)
+        
+        # Update empirical normalization statistics if enabled.
+        if self.config.empirical_normalization:
+            # Get critic observations for all trajectories
+            get_critic_obs_fn = xax.vmap(
+                xax.vmap(self.get_critic_obs, in_axes=(0, 0)),
+                in_axes=(0, 0),
+            )
+            critic_obs_bt = get_critic_obs_fn(trajectories.obs, trajectories.command)
+            
+            # Update running statistics
+            current_norm_state = carry.shared_state.aux_values["obs_norm_state"]
+            updated_norm_state = update_empirical_normalization_state(
+                current_norm_state,
+                critic_obs_bt,
+            )
+            
+            # Store updated statistics
+            aux_vals = {**dict(carry.shared_state.aux_values)}
+            aux_vals["obs_norm_state"] = updated_norm_state
+            carry = replace(
+                carry,
+                shared_state=replace(
+                    carry.shared_state,
+                    aux_values=xax.freeze_dict(aux_vals),
+                ),
+            )
 
         # Loops over the trajectory batches and applies gradient updates.
         def update_model_in_batch(
